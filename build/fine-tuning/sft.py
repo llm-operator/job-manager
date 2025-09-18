@@ -5,14 +5,20 @@
 import logging
 import os
 import argparse
+import json
 
+from PIL import Image
 import torch
+import numpy as np
 
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
     BitsAndBytesConfig,
+    Qwen2_5OmniConfig,
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
 )
 
 from peft import LoraConfig
@@ -32,23 +38,33 @@ tqdm.pandas()
 # Helpers
 # --------------------------------------------------------------------------------
 
+
 # Create preprocessor to ensure training data is well-formed
-def build_chat_preprocessor(tokenizer):
-    eos_id = tokenizer.eos_token_id
+def build_chat_preprocessor(tokenizer, isQwen2_5Omni):
+    if isQwen2_5Omni:
+        # Qwen2_5Omni expects both "messages" and "images" fields. Use a dummy image.
+        dummy_image = Image.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
+        def _preprocess(example):
+            return {"messages": example["messages"], "images": [dummy_image]}
 
-    # Create a closure with tokenizer and eos to preprocess the dataset on the specific tokenizer
-    def _preprocess(example):
-        """Turn a list‑of‑messages into input_ids + single EOS."""
-        text = tokenizer.apply_chat_template(
-            example["messages"],  # expects list[dict]
-            add_generation_prompt=False,
-            tokenize=False,
-        )
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        ids.append(eos_id)
-        return {"input_ids": ids}
+        return _preprocess
 
-    return _preprocess
+    else:
+        eos_id = tokenizer.eos_token_id
+
+        # Create a closure with tokenizer and eos to preprocess the dataset on the specific tokenizer
+        def _preprocess(example):
+            """Turn a list‑of‑messages into input_ids + single EOS."""
+            text = tokenizer.apply_chat_template(
+                example["messages"],  # expects list[dict]
+                add_generation_prompt=False,
+                tokenize=False,
+            )
+            ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            ids.append(eos_id)
+            return {"input_ids": ids}
+
+        return _preprocess
 
 # --------------------------------------------------------------------------------
 # Main
@@ -73,14 +89,26 @@ if __name__ == "__main__":
     if args.report_to == "wandb":
         os.environ["WANDB_PROJECT"] = args.wandb_project
 
+    # Read args.model, parse the json, and extract the architecture
+    isQwen2_5Omni = False
+    with open(os.path.join(args.model, "config.json"), "r") as f:
+        c = json.load(f)
+        arch = c.get("architectures", [None])[0]
+        if arch == "Qwen2_5OmniModel":
+            print("Detected Qwen2_5Omni architecture.")
+            isQwen2_5Omni = True
+
     # ------------------------------------------------------------------
     # Tokenizer – set distinct PAD and right-pad. This isn't strictly necessary for all models, but
     # it is for some models (e.g. Llama). It also sets the padding side to "right" for all models to be consistent
     # ------------------------------------------------------------------
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = "<|finetune_right_pad_id|>"
-    tokenizer.padding_side = "right"
+    if isQwen2_5Omni:
+        tokenizer = Qwen2_5OmniProcessor.from_pretrained(args.model)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = "<|finetune_right_pad_id|>"
+        tokenizer.padding_side = "right"
 
     # ------------------------------------------------------------------
     # Load model (with optional 4‑bit quant)
@@ -93,25 +121,37 @@ if __name__ == "__main__":
             bnb_4bit_quant_type="nf4"
         )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        attn_implementation=None,
-        # Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed,
-        # the dtype will be automatically derived from the model's weights."
-        torch_dtype="auto",
-        # Setting this to False as `use_cache=True` is incompatible with gradient checkpointing.
-        use_cache=False,
-        device_map=get_kbit_device_map(),
-        quantization_config=quantization_config,
-    )
-    # Ensure the model and tokenizer agree on the pad token.
-    model.config.pad_token_id = tokenizer.pad_token_id
+
+    if isQwen2_5Omni:
+        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
+            args.model,
+            attn_implementation=None,
+            # Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed,
+            # the dtype will be automatically derived from the model's weights."
+            torch_dtype="auto",
+            device_map=get_kbit_device_map(),
+            quantization_config=quantization_config,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            attn_implementation=None,
+            # Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed,
+            # the dtype will be automatically derived from the model's weights."
+            torch_dtype="auto",
+            # Setting this to False as `use_cache=True` is incompatible with gradient checkpointing.
+            use_cache=False,
+            device_map=get_kbit_device_map(),
+            quantization_config=quantization_config,
+        )
+        # Ensure the model and tokenizer agree on the pad token.
+        model.config.pad_token_id = tokenizer.pad_token_id
 
     raw_datasets = load_dataset(args.dataset)
     train_dataset = raw_datasets["train"]
     eval_dataset = raw_datasets["test"] if "test" in raw_datasets else None
 
-    preprocess_fn = build_chat_preprocessor(tokenizer)
+    preprocess_fn = build_chat_preprocessor(tokenizer, isQwen2_5Omni)
     num_proc = min(4, os.cpu_count() or 1)
 
     # Preprocess the datasets with eos_id at the end so even if a model doesn't do it by default we can still train it
@@ -156,6 +196,9 @@ if __name__ == "__main__":
         # Used only in case `dataset_text_field` is passed. This argument is used by the `ConstantLengthDataset`
         # to pack the sequences of the dataset.
         packing=False,
+        # Required for Qwen2_5Omni training. Otherwise, we get the following error:
+        #   "No columns in the dataset match the model's forward method signature: (messages, prompt, completion, images)."
+        remove_unused_columns=False,
     )
 
     # TODO(kenji): Revisit these parameters.

@@ -9,5 +9,7 @@ trl
 peft
 gguf
 wandb
+pillow
+torchvision
 # TODO(kenji): Add this back. We're getting No module named 'torch'.
 # autoawq
